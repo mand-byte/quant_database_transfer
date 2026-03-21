@@ -1,0 +1,4 @@
+clickhouse-connect>=0.8.2
+pandas>=2.0.0
+python-dotenv>=1.0.1
+apscheduler>=3.10.4

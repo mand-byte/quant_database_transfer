@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  database-syncer:
+    build: .
+    container_name: quant-database-transfer
+    restart: unless-stopped
+    # 采用宿主机网络，这样脚本就可以通过 192.168.1.2 这种群晖内网 IP 直接连到你的目标 ClickHouse 上
+    network_mode: bridge  
+    env_file:
+      - .env
+    # 设置容器内时区，确保定时任务准点触发
+    environment:
+      - TZ=Asia/Shanghai
+    # 限制转移脚本的内存占用，防止大量数据塞爆群晖内存
+    deploy:
+      resources:
+        limits:
+          memory: 512M
