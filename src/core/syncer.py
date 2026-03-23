@@ -3,8 +3,6 @@ import time
 from datetime import date, datetime
 from typing import Any
 
-import pandas as pd
-
 from src.dao.clickhouse_manager import ClickHouseManager
 from src.utils.logger import app_logger
 
@@ -22,7 +20,8 @@ class DatabaseSyncer:
     def __init__(self) -> None:
         self.src = ClickHouseManager.get_source_client()
         self.dest = ClickHouseManager.get_target_client()
-        self.batch_size = int(os.getenv("SYNC_BATCH_SIZE", "50000"))
+        # Use a conservative default to keep container memory stable on NAS.
+        self.batch_size = int(os.getenv("SYNC_BATCH_SIZE", "5000"))
         self.max_retries = int(os.getenv("SYNC_RETRY_TIMES", "3"))
         self.retry_sleep_seconds = float(os.getenv("SYNC_RETRY_SLEEP_SECONDS", "1.0"))
 
@@ -47,10 +46,11 @@ class DatabaseSyncer:
         table_ident = self._quote_ident(table)
 
         self._ensure_target_table_exists(table, table_ident)
+        self._ensure_target_columns_compatible(table, table_ident)
 
         cols = self.src.query(f"DESCRIBE TABLE {table_ident}").result_rows
         col_names = [col[0] for col in cols]
-        col_type_map = {col[0]: col[1] for col in cols}
+        col_names_ident = ", ".join(self._quote_ident(col) for col in col_names)
 
         inc_col = next((c for c in self.INCREMENTAL_CANDIDATES if c in col_names), None)
         if not inc_col:
@@ -76,32 +76,71 @@ class DatabaseSyncer:
             f"Syncing [{table}] via incremental column [{inc_col}] with batch_size={self.batch_size}, where={where_clause}"
         )
 
-        offset = 0
+        # Cursor window pagination without OFFSET:
+        # 1) probe a small batch to get current upper bound
+        # 2) pull full window (lower_bound, upper_bound] (or [lower_bound, upper_bound] for first window)
+        # This avoids deep OFFSET scans and supports safe resume after interruption.
+        lower_bound = max_val_res
+        include_lower_bound = max_val_res is not None and not str(max_val_res).startswith("1970")
         total_synced = 0
         while True:
-            query = (
-                f"SELECT * FROM {table_ident} "
-                f"WHERE {where_clause} "
+            probe_cursor_clause = self._build_cursor_clause(
+                inc_col_ident,
+                lower_bound,
+                include_lower_bound,
+            )
+            probe_where = f"({where_clause}) AND ({probe_cursor_clause})"
+            probe_query = (
+                f"SELECT {inc_col_ident} FROM {table_ident} "
+                f"WHERE {probe_where} "
                 f"ORDER BY {inc_col_ident} ASC "
-                f"LIMIT {self.batch_size} OFFSET {offset}"
+                f"LIMIT {self.batch_size}"
             )
-            df = self._with_retry(lambda: self.src.query_df(query), f"query source batch for {table}")
-
-            if df.empty:
-                break
-
-            self._normalize_datetime_columns(df, col_type_map)
-            self._with_retry(lambda: self.dest.insert_df(table, df), f"insert batch for {table}")
-
-            batch_rows = len(df)
-            total_synced += batch_rows
-            offset += batch_rows
             app_logger.info(
-                f"✅ Synced batch for [{table}] rows={batch_rows}, total={total_synced}, next_offset={offset}"
+                f"🔎 Probing [{table}] cursor window with lower="
+                f"{self._to_sql_literal(lower_bound) if lower_bound is not None else 'NULL'}"
+            )
+            probe_result = self._with_retry(lambda: self.src.query(probe_query), f"probe source batch for {table}")
+            probe_rows = probe_result.result_rows
+
+            if not probe_rows:
+                break
+
+            upper_bound = probe_rows[-1][0]
+            window_cursor_clause = self._build_window_clause(
+                inc_col_ident,
+                lower_bound,
+                include_lower_bound,
+                upper_bound,
+            )
+            window_where = f"({where_clause}) AND ({window_cursor_clause})"
+            query = (
+                f"SELECT {col_names_ident} FROM {table_ident} "
+                f"WHERE {window_where} "
+                f"ORDER BY {inc_col_ident} ASC"
+            )
+            result = self._with_retry(lambda: self.src.query(query), f"query source window for {table}")
+            rows = result.result_rows
+
+            if not rows:
+                lower_bound = upper_bound
+                include_lower_bound = False
+                continue
+
+            self._with_retry(
+                lambda: self.dest.insert(table=table, data=rows, column_names=col_names),
+                f"insert batch for {table}",
             )
 
-            if batch_rows < self.batch_size:
-                break
+            batch_rows = len(rows)
+            total_synced += batch_rows
+            app_logger.info(
+                f"✅ Synced batch for [{table}] rows={batch_rows}, total={total_synced}, "
+                f"next_cursor>{self._to_sql_literal(upper_bound)}"
+            )
+
+            lower_bound = upper_bound
+            include_lower_bound = False
 
         if total_synced == 0:
             app_logger.info(f"⚡ Table {table} is already up-to-date.")
@@ -129,19 +168,51 @@ class DatabaseSyncer:
                 return
             raise
 
+    def _ensure_target_columns_compatible(self, table: str, table_ident: str) -> None:
+        src_cols = self.src.query(f"DESCRIBE TABLE {table_ident}").result_rows
+        dst_cols = self.dest.query(f"DESCRIBE TABLE {table_ident}").result_rows
+        dst_col_names = {row[0] for row in dst_cols}
+
+        for col_name, col_type, *_ in src_cols:
+            if col_name in dst_col_names:
+                continue
+            add_col_sql = (
+                f"ALTER TABLE {table_ident} "
+                f"ADD COLUMN IF NOT EXISTS {self._quote_ident(col_name)} {col_type}"
+            )
+            self._with_retry(
+                lambda sql=add_col_sql: self.dest.command(sql),
+                f"add missing column {col_name} for {table}",
+            )
+            app_logger.warning(
+                f"⚠️ Added missing target column for [{table}]: {col_name} {col_type}"
+            )
+
     def _build_where_clause_for_source(self, max_val_res: Any, inc_col_ident: str) -> str:
         if max_val_res is None or str(max_val_res).startswith("1970"):
             return "1=1"
         return f"{inc_col_ident} >= {self._to_sql_literal(max_val_res)}"
 
-    def _normalize_datetime_columns(self, df: pd.DataFrame, col_type_map: dict[str, str]) -> None:
-        # 统一把 tz-aware 时间转成 UTC 后再去掉 tz，避免本地时区误差
-        for col in df.columns:
-            if "DateTime" not in col_type_map.get(col, ""):
-                continue
-            if not pd.api.types.is_datetime64tz_dtype(df[col]):
-                continue
-            df[col] = df[col].dt.tz_convert("UTC").dt.tz_localize(None)
+    def _build_cursor_clause(self, inc_col_ident: str, lower_bound: Any, include_lower: bool) -> str:
+        if lower_bound is None or str(lower_bound).startswith("1970"):
+            return "1=1"
+        op = ">=" if include_lower else ">"
+        return f"{inc_col_ident} {op} {self._to_sql_literal(lower_bound)}"
+
+    def _build_window_clause(
+        self,
+        inc_col_ident: str,
+        lower_bound: Any,
+        include_lower: bool,
+        upper_bound: Any,
+    ) -> str:
+        if lower_bound is None or str(lower_bound).startswith("1970"):
+            return f"{inc_col_ident} <= {self._to_sql_literal(upper_bound)}"
+        lower_op = ">=" if include_lower else ">"
+        return (
+            f"{inc_col_ident} {lower_op} {self._to_sql_literal(lower_bound)} "
+            f"AND {inc_col_ident} <= {self._to_sql_literal(upper_bound)}"
+        )
 
     def _with_retry(self, func, action: str):
         for attempt in range(1, self.max_retries + 1):
@@ -165,6 +236,9 @@ class DatabaseSyncer:
         if value is None:
             return "NULL"
         if isinstance(value, datetime):
+            if value.microsecond:
+                # Preserve sub-second precision to avoid widening incremental windows.
+                return f"toDateTime64('{value.strftime('%Y-%m-%d %H:%M:%S.%f')}', 6)"
             return f"toDateTime('{value.strftime('%Y-%m-%d %H:%M:%S')}')"
         if isinstance(value, date):
             return f"toDate('{value.strftime('%Y-%m-%d')}')"
